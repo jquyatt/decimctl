@@ -4,5 +4,8 @@
 # Setuptools distribution folder.
 /dist/
 
+# The decimator-net fork also ignores generated build output.
+/build/
+
 # Python egg metadata, regenerated from source files by setuptools.
 /*.egg-info

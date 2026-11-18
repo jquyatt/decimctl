@@ -16,6 +16,8 @@ Bit 5 (0x20): Unknown (used in firmware erase)
 Bit 6 (0x40): Clock to FPGA (always driven by FTDI)
 Bit 7 (0x80): Unknown (used in firmware erase)
 
+Modified by the decimator-net project for MD-HX V2 register decoding.
+
 Copyright 2019 Quentin Smith <quentin@mit.edu>
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -332,9 +334,12 @@ class CPA_Registers(Registers):
         ("DUCFormat", c_ubyte), # 0x22 & 0x1f
         ("DUC_S2S_Aspect", c_ubyte), # & 0x1f
         ("DUC_S2H_Aspect", c_ubyte), # & 0x1f
-        ("DUC_H2S_Aspect", c_ubyte), # & 0x1f
+        ("DUC_H2S_Aspect", c_ubyte), # IN IMAGE: low 5 bits; OUT IMAGE: high 3 bits
         ("DUC_H2H_Aspect", c_ubyte), # & 0x1f
-        ("unknownDUC_TH1", c_ubyte, 5),
+        # Both fields occupy the same big-endian 16-bit register. Using an
+        # 8-bit storage unit here inserts an extra byte in ctypes and shifts
+        # every later CPA field, including output routing.
+        ("unknownDUC_TH1", c_ushort, 5),
         ("DUC_TH1", c_ushort, 11), # & 0x3FF
         ("unknown29", c_ubyte),
         ("unknownDUC_HF", c_ubyte, 5),
@@ -436,6 +441,358 @@ class CPA_Registers(Registers):
     @property
     def Input2Status(self):
         return CPA_CalcFormatString(self.Input2Locked, self.Input2Standard, self.Input2HDFractional, self.Input2Format, self.Input23GB)
+
+
+def CPA_HX_V2_CalcFormatString(format_byte, status_byte):
+    """Decode the input status bytes used by newer MD-HX hardware.
+
+    Unlike the original CPA layout, bit 4 of the status byte is the lock
+    flag, bits 1-3 select the standard, and bit 0 selects 3G-B.
+    """
+    if not status_byte & 0x10:
+        return "Unlocked"
+
+    standard = (status_byte >> 1) & 0x07
+    threeg_b = status_byte & 0x01
+    if standard == 0:
+        return CPA_CalcFormatString(1, InputStandard.SD_SDI, 0, format_byte, threeg_b)
+    if standard == 2:
+        return CPA_CalcFormatString(1, InputStandard.ED_SDI, 0, format_byte, threeg_b)
+    if standard in (4, 5):
+        return CPA_CalcFormatString(1, InputStandard.HD_SDI, standard == 5, format_byte, threeg_b)
+    if standard in (6, 7):
+        formats = {
+            6: {0x20: "1920x1080p60", 0x22: "1920x1080p50",
+                0x28: "2048x1080p60", 0x2a: "2048x1080p50"},
+            7: {0x21: "1920x1080p59.94", 0x29: "2048x1080p59.94"},
+        }
+        format_name = formats[standard].get(format_byte)
+        if format_name is not None:
+            return ("3G-B " if threeg_b else "3G-A ") + format_name
+    return "Unknown"
+
+
+def _cpa_hx_v2_standard(status_byte):
+    """Map the newer on-wire standard code to the public CPA enum."""
+    code = (status_byte >> 1) & 0x07
+    return {0: 0, 2: 1, 4: 2, 5: 2, 6: 3, 7: 3}.get(code, 255)
+
+
+# Newer MD-HX output-format codes are menu indices. The original CPA
+# DUCFormat enum uses a different order, so it must not label these bytes.
+CPA_HX_V2_OUTPUT_FORMATS = (
+    "SD 720x480i59.94", "SD 720x576i50",
+    "ED 720x480p59.94", "ED 720x576p50",
+    "HD 1280x720p60", "HD 1280x720p59.94", "HD 1280x720p50",
+    "HD 1280x720p30", "HD 1280x720p29.97", "HD 1280x720p25",
+    "HD 1280x720p24", "HD 1280x720p23.98",
+    "HD 1920x1080i60", "HD 1920x1080i59.94", "HD 1920x1080i50",
+    "HD 1920x1080psf30", "HD 1920x1080psf29.97",
+    "HD 1920x1080psf25", "HD 1920x1080psf24",
+    "HD 1920x1080psf23.98", "HD 1920x1080p30",
+    "HD 1920x1080p29.97", "HD 1920x1080p25",
+    "HD 1920x1080p24", "HD 1920x1080p23.98",
+    "HD 2048x1080psf30", "HD 2048x1080psf29.97",
+    "HD 2048x1080psf25", "HD 2048x1080psf24",
+    "HD 2048x1080psf23.98", "HD 2048x1080p30",
+    "HD 2048x1080p29.97", "HD 2048x1080p25",
+    "HD 2048x1080p24", "HD 2048x1080p23.98",
+    "3G 1920x1080p60", "3G 1920x1080p59.94",
+    "3G 1920x1080p50", "3G 2048x1080p60",
+    "3G 2048x1080p59.94", "3G 2048x1080p50",
+)
+
+# MD-HX V2 operating manual, Scaling/TPG → Pattern. Register 0x81 low six
+# bits are zero-based menu indices; entries are kept in front-panel order.
+CPA_HX_V2_TPG_PATTERNS = (
+    "SMPTE HD Bars", "Bars 100/0/100/0", "Bars 100/0/75/0",
+    "Bars 75/0/75/0", "Bars 100% & Red", "SMPTE EG 1 Bars",
+    "Path EQ & PLL", "EQ", "PLL", "Square on 4:3",
+    "Square on 16:9", "5 Step Y Staircase", "5 Step UV Staircase",
+    "Y Ramp", "UV Ramp", "Pluge", "Convergence", "Tartan Bars",
+    "1/8 Fields White", "White 100%", "White 75%", "Black",
+    "Red 100%", "Red 75%", "Yellow 100%", "Yellow 75%",
+    "Green 100%", "Green 75%", "Blue 100%", "Blue 75%",
+    "Magenta 100%", "Magenta 75%", "Cyan 100%", "Cyan 75%",
+    "Y Static X ZP/L", "Y Static X ZP/H", "Y Static Y ZP",
+    "Y Move Lt X ZP", "Y Move Rt X ZP", "Y Move Up Y ZP",
+    "Y Move Dn Y ZP", "Y Move Up XY ZP", "Y Move Dn XY ZP",
+    "Y Static C ZP", "Y Move In C ZP", "Y Move Out C ZP",
+    "C Static X ZP/L", "C Static X ZP/H", "C Static Y ZP",
+    "C Move Lt X ZP", "C Move Rt X ZP", "C Move Up Y ZP",
+    "C Move Dn Y ZP", "C Move Up XY ZP", "C Move Dn XY ZP",
+    "C Static C ZP", "C Move In C ZP", "C Move Out C ZP",
+)
+
+# UMD foreground raw codes are zero-based over the 24 colored entries followed
+# by None. Hardware checks on an MD-HX V2 confirmed the boundary and final
+# group: code 0 is Black (Transparent 50%), code 16 is Black (Transparent 0%),
+# and codes 21..23 are Magenta/Yellow/White (Transparent 0%). Selecting code
+# 24, labelled None, still rendered near-black glyphs in a live capture; a
+# front-panel comparison is needed to determine whether the native menu uses
+# the same label and code.
+CPA_HX_V2_UMD_FOREGROUNDS = (
+    "Black (Transparent 50%)", "Blue (Transparent 50%)",
+    "Green (Transparent 50%)", "Cyan (Transparent 50%)",
+    "Red (Transparent 50%)", "Magenta (Transparent 50%)",
+    "Yellow (Transparent 50%)", "White (Transparent 50%)",
+    "Black (Transparent 25%)", "Blue (Transparent 25%)",
+    "Green (Transparent 25%)", "Cyan (Transparent 25%)",
+    "Red (Transparent 25%)", "Magenta (Transparent 25%)",
+    "Yellow (Transparent 25%)", "White (Transparent 25%)",
+    "Black (Transparent 0%)", "Blue (Transparent 0%)",
+    "Green (Transparent 0%)", "Cyan (Transparent 0%)",
+    "Red (Transparent 0%)", "Magenta (Transparent 0%)",
+    "Yellow (Transparent 0%)", "White (Transparent 0%)", "None",
+)
+
+# MD-HX V2 manual, Text Overlays → Background (printed p. 17). The menu has
+# one None choice followed by 24 colours. The 5-bit register encodes None as 0,
+# then stores the three eight-colour transparency groups at raw codes 8–31.
+# Hardware output checks confirmed raw 8–15 as the first eight-colour group,
+# raw 16–23 as the second, and raw 24 as the start of the third; codes 1–7
+# produced no visible band. The manual's menu order and these observed groups
+# reconcile as None → raw 0, then menu entries 1–24 → raw 8–31.
+CPA_HX_V2_UMD_BACKGROUNDS = (
+    "None",
+    "Black (Transparent 50%)", "Blue (Transparent 50%)",
+    "Green (Transparent 50%)", "Cyan (Transparent 50%)",
+    "Red (Transparent 50%)", "Magenta (Transparent 50%)",
+    "Yellow (Transparent 50%)", "White (Transparent 50%)",
+    "Black (Transparent 25%)", "Blue (Transparent 25%)",
+    "Green (Transparent 25%)", "Cyan (Transparent 25%)",
+    "Red (Transparent 25%)", "Magenta (Transparent 25%)",
+    "Yellow (Transparent 25%)", "White (Transparent 25%)",
+    "Black (Transparent 0%)", "Blue (Transparent 0%)",
+    "Green (Transparent 0%)", "Cyan (Transparent 0%)",
+    "Red (Transparent 0%)", "Magenta (Transparent 0%)",
+    "Yellow (Transparent 0%)", "White (Transparent 0%)",
+)
+CPA_HX_V2_UMD_BACKGROUND_MENU_TO_RAW = (0, *range(8, 32))
+CPA_HX_V2_UMD_BACKGROUND_RAW_TO_MENU = {
+    raw_code: menu_code
+    for menu_code, raw_code in enumerate(CPA_HX_V2_UMD_BACKGROUND_MENU_TO_RAW)
+}
+
+# MD-HX V2 manual, Text Overlays → No Signal ForeGD/BackGD. Register codes
+# are zero-based in the order of the eight front-panel colour choices.
+CPA_HX_V2_NO_SIGNAL_COLORS = (
+    "Black", "Blue", "Green", "Cyan", "Red", "Magenta", "Yellow", "White",
+)
+
+# MD-HX V2 manual, Aspect → SD IN ASPECT. Codes follow front-panel order.
+CPA_HX_V2_SD_IN_ASPECTS = ("4:3", "14:9", "16:9")
+CPA_HX_V2_SD_OUT_ASPECTS = ("4:3", "14:9", "16:9")
+# MD-HX V2 manual, Aspect → IN IMAGE ASPECT. Codes follow menu order; the
+# front-panel transition Input → 4:3 was observed as raw code 0 → 1.
+CPA_HX_V2_IN_IMAGE_ASPECTS = (
+    "Input", "4:3 (1.333)", "14:9 (1.556)", "16:9 (1.778)",
+    "256:135 (1.896)", "64:87 (0.736)", "3:4 (0.75)", "1:1 (1)",
+    "5:4 (1.25)", "32:25 (1.28)", "192:145 (1.324)", "296:221 (1.339)",
+    "960:617 (1.556)", "467:300 (1.557)", "51:32 (1.594)", "307:192 (1.599)",
+    "8:5 (1.6)", "5:3 (1.667)", "53:30 (1.767)", "85:48 (1.771)",
+    "133:75 (1.773)", "71:40 (1.775)", "932:525 (1.775)", "341:192 (1.776)",
+    "683:384 (1.779)", "9:5 (1.8)", "64:35 (1.829)", "72:35 (2.057)",
+)
+# MD-HX V2 manual, Aspect → OUT IMAGE ASPECT. The observed transition from
+# the first to second menu option sets bit 5 while preserving IN IMAGE bits.
+CPA_HX_V2_OUT_IMAGE_ASPECTS = (
+    "AN or LB or PB", "AN or CC", "AN or LC or TC",
+    "AN or RC or BC", "16:9", "Stretch",
+)
+CPA_HX_V2_GRATICULE_SAFE_ACTION_OFFSET = 0x50
+CPA_HX_V2_GRATICULE_SAFE_ACTION_MASK = 0x01
+CPA_HX_V2_GRATICULE_SAFE_TITLE_OFFSET = 0x55
+CPA_HX_V2_GRATICULE_SAFE_TITLE_MASK = 0x01
+CPA_HX_V2_GRATICULE_CENTRE_CROSS_OFFSET = 0x5a
+CPA_HX_V2_GRATICULE_CENTRE_CROSS_MASK = 0x01
+CPA_HX_V2_GRATICULE_COLOR_MASK = 0x3e
+CPA_HX_V2_GRATICULE_COLOR_CODE_BASE = 7
+CPA_HX_V2_GRATICULE_OUTSIDE_SAFE_ACTION_COLOR_OFFSET = 0x5b
+CPA_HX_V2_GRATICULE_OUTSIDE_SAFE_ACTION_COLOR_MASK = 0x1f
+CPA_HX_V2_GRATICULE_OUTSIDE_SAFE_ACTION_COLOR_SHIFT = 0
+CPA_HX_V2_GRATICULE_OUTSIDE_SAFE_ACTION_MENU_TO_RAW = CPA_HX_V2_UMD_BACKGROUND_MENU_TO_RAW
+CPA_HX_V2_GRATICULE_OUTSIDE_SAFE_ACTION_RAW_TO_MENU = CPA_HX_V2_UMD_BACKGROUND_RAW_TO_MENU
+# The manual describes graticule geometry as 0–100% in 0.5% increments.
+# SA Vert Start was observed at byte 0x52: 5.0% -> 5.5% changed 0x0a -> 0x0b.
+CPA_HX_V2_GRATICULE_SA_VERT_START_OFFSET = 0x52
+CPA_HX_V2_GRATICULE_SA_HORZ_START_OFFSET = 0x51
+CPA_HX_V2_GRATICULE_SA_HORZ_END_OFFSET = 0x53
+CPA_HX_V2_GRATICULE_SA_VERT_END_OFFSET = 0x54
+CPA_HX_V2_GRATICULE_ST_HORZ_START_OFFSET = 0x56
+CPA_HX_V2_GRATICULE_ST_HORZ_END_OFFSET = 0x58
+CPA_HX_V2_GRATICULE_ST_VERT_START_OFFSET = 0x57
+CPA_HX_V2_GRATICULE_ST_VERT_END_OFFSET = 0x59
+# The manual's “16:9 LB on 4:3” action was observed to set the four horizontal
+# Safe Action/Title bounds to these half-percent register values.
+CPA_HX_V2_GRATICULE_16_9_LB_ON_4_3 = (35, 165, 45, 155)
+# The observed “4:3 PB on 16:9” front-panel action sets the vertical bounds.
+CPA_HX_V2_GRATICULE_4_3_PB_ON_16_9 = (35, 165, 45, 155)
+# Anamorphic was observed to restore these default SA/ST geometry bounds.
+CPA_HX_V2_GRATICULE_ANAMORPHIC = (10, 190, 10, 190, 20, 180, 20, 180)
+CPA_HX_V2_GRATICULE_COLORS = (
+    "None", "Black (Transparent 50%)", "Blue (Transparent 50%)",
+    "Green (Transparent 50%)", "Cyan (Transparent 50%)",
+    "Red (Transparent 50%)", "Magenta (Transparent 50%)",
+    "Yellow (Transparent 50%)", "White (Transparent 50%)",
+    "Black (Transparent 25%)", "Blue (Transparent 25%)",
+    "Green (Transparent 25%)", "Cyan (Transparent 25%)",
+    "Red (Transparent 25%)", "Magenta (Transparent 25%)",
+    "Yellow (Transparent 25%)", "White (Transparent 25%)",
+    "Black (Transparent 0%)", "Blue (Transparent 0%)",
+    "Green (Transparent 0%)", "Cyan (Transparent 0%)",
+    "Red (Transparent 0%)", "Magenta (Transparent 0%)",
+    "Yellow (Transparent 0%)", "White (Transparent 0%)",
+)
+
+CPA_HX_V2_INPUT_FORMAT_OVERLAY_OPTIONS = (
+    "Off", "Show for 20 seconds", "Show Always",
+)
+
+CPA_HX_V2_TEST_AUDIO = (
+    "Off",
+    "1 kHz Tone",
+    "1 kHz / 500 Hz / Broken Tones",
+    "Left 1 kHz, Right Broken 1 kHz",
+)
+
+# MD-HX V2 Audio Meters menu labels and register-code order from the public
+# manual and direct hardware observations. Controlled HX reads confirmed that
+# transparency codes 1, 2, and 3 represent 50%, 25%, and 0%; code 0 is not a
+# selectable menu value.
+CPA_HX_V2_AM_STYLES = ("Vertical Bars", "Horizontal Bars")
+CPA_HX_V2_AM_COMBINATIONS = ("None", "Bar Only", "Float Only", "Bar and Float")
+CPA_HX_V2_AM_TRANSPARENCY = (None, "50%", "25%", "0%")
+CPA_HX_V2_AM_BAR_SCALES = (
+    "AES/EBU", "VU", "Extended VU", "BBC PPM (IEC 2a)",
+    "EBU PPM (IEC 2b)", "DIN PPM (IEC 1a)", "NORDIC (IEC 1b)",
+)
+CPA_HX_V2_AM_BALLISTICS = ("VU", "IEC1", "IEC2")
+CPA_HX_V2_AM_REFERENCE_LEVELS = ("-20 dBFS", "-18 dBFS", "-15 dBFS")
+
+
+class CPA_HX_V2_Registers(Registers):
+    """CPA registers with the newer MD-HX input-status encoding.
+
+    Other register definitions are shared with CPA_Registers pending a
+    device-specific comparison. The four input bytes use a distinct layout.
+    """
+
+    _pack_ = 1
+    _shared_fields = CPA_Registers._fields_
+    _audio_register_index = next(
+        i for i, field in enumerate(_shared_fields) if field[0] == "unknown62"
+    )
+    _fields_ = CPA_Registers._fields_[:4] + [
+        ("Input1Format", c_ubyte),
+        ("Input1StatusRaw", c_ubyte),
+        ("Input2Format", c_ubyte),
+        ("Input2StatusRaw", c_ubyte),
+    ] + _shared_fields[16:_audio_register_index] + [
+        # 0x62: Bar Scale (bits 0..2), Bar Ballistics (3..4), and Float
+        # Ballistics (5..6), confirmed by one-field-at-a-time HX writes.
+        ("unknown62High", c_ubyte, 1),
+        ("AM_FloatBallistics", c_ubyte, 2),
+        ("AM_BarBallistics", c_ubyte, 2),
+        ("AM_BarScale", c_ubyte, 3),
+        # 0x63: UI value in percent is stored doubled.
+        ("AM_Margin", c_ubyte),
+        # 0x64: reference level in bits 4-5, thickness code in bits 0-3.
+        ("unknown64High", c_ubyte, 2),
+        ("AM_ReferenceLevel", c_ubyte, 2),
+        ("AM_BarThickness", c_ubyte, 4),
+        # 0x65/0x66 are dBFS threshold values stored in half-dB units.
+        ("AM_YellowStart", c_ubyte),
+        ("AM_GreenStart", c_ubyte),
+        ("unknown67", c_ubyte * 9),
+    ] + _shared_fields[_audio_register_index + 1:] + [
+        # 0x84..0xbf: currently undocumented register space.
+        ("unknown84", c_ubyte * 0x3c),
+        # 0xc0..0xcf: fixed-width UMD text, confirmed by front-panel change.
+        ("UMD_Text", c_char * 16),
+    ]
+    del _shared_fields, _audio_register_index
+    _map = {name: enum_type for name, enum_type in CPA_Registers._map.items()
+            if name != "DUCFormat"}
+
+    @property
+    def OutputFormat(self):
+        code = self.DUCFormat & 0x3f
+        return (CPA_HX_V2_OUTPUT_FORMATS[code]
+                if code < len(CPA_HX_V2_OUTPUT_FORMATS) else "Unknown")
+
+    @property
+    def Input1Locked(self):
+        return bool(self.Input1StatusRaw & 0x10)
+
+    @property
+    def Input2Locked(self):
+        return bool(self.Input2StatusRaw & 0x10)
+
+    @property
+    def Input1Standard(self):
+        return _cpa_hx_v2_standard(self.Input1StatusRaw)
+
+    @property
+    def Input2Standard(self):
+        return _cpa_hx_v2_standard(self.Input2StatusRaw)
+
+    @property
+    def Input1HDFractional(self):
+        return int(((self.Input1StatusRaw >> 1) & 0x07) in (5, 7))
+
+    @property
+    def Input2HDFractional(self):
+        return int(((self.Input2StatusRaw >> 1) & 0x07) in (5, 7))
+
+    @property
+    def Input13GB(self):
+        return self.Input1StatusRaw & 0x01
+
+    @property
+    def Input23GB(self):
+        return self.Input2StatusRaw & 0x01
+
+    @property
+    def Input1Status(self):
+        return CPA_HX_V2_CalcFormatString(self.Input1Format, self.Input1StatusRaw)
+
+    @property
+    def Input2Status(self):
+        return CPA_HX_V2_CalcFormatString(self.Input2Format, self.Input2StatusRaw)
+
+
+class CPA_LX_Registers(Registers):
+    """CPA registers with the MD-LX output-mode interpretation."""
+
+    _pack_ = 1
+    _fields_ = CPA_Registers._fields_
+    _map = {name: enum_type for name, enum_type in CPA_Registers._map.items()
+            if name != "ReturnToStatusTime"}
+
+    _output_modes = (
+        "Auto Select",
+        "SDI to HDMI / HDMI to SDI",
+        "SDI to HDMI and SDI",
+        "HDMI to HDMI and SDI",
+    )
+
+    @property
+    def OutputMode(self):
+        return self._output_modes[self.LXA_Out & 0x03]
+
+    @property
+    def Input1Status(self):
+        return CPA_CalcFormatString(self.Input1Locked, self.Input1Standard,
+                                    self.Input1HDFractional, self.Input1Format,
+                                    self.Input13GB)
+
+    @property
+    def Input2Status(self):
+        return CPA_CalcFormatString(self.Input2Locked, self.Input2Standard,
+                                    self.Input2HDFractional, self.Input2Format,
+                                    self.Input23GB)
+
 
 class MVReference(IntEnum):
     FREE_RUN = 0

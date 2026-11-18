@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Modified by the decimator-net project to add JSON status output.
 
 import argparse
 import decimctl
@@ -6,6 +7,7 @@ import os
 import sys
 import enum
 import struct
+import json
 
 def list_devices(args):
     devices = decimctl.list_devices()
@@ -24,6 +26,9 @@ def registers(args):
 
 def status(args):
     d = _create_device(args)
+    if args.json:
+        print(json.dumps(decimctl.status_snapshot(d)))
+        return
     print("Model: %s Serial: %s" % (d.desc, d.serial))
     if d.custom_name:
         print("Custom name: %s" % (d.custom_name))
@@ -36,6 +41,10 @@ def status(args):
         print("Input 2 status: %s" % reg.Input2Status)
     if hasattr(reg, "Input3Status"):
         print("Input 3 status: %s" % reg.Input3Status)
+    if hasattr(reg, "OutputFormat"):
+        print("Configured scaler output format: %s" % reg.OutputFormat)
+    if hasattr(reg, "OutputMode"):
+        print("Output mode: %s" % reg.OutputMode)
     print(reg)
 
 def set_register(args):
@@ -101,6 +110,7 @@ def main():
     parser_set_register.set_defaults(func=set_register)
 
     parser_status = subparsers.add_parser('status', parents=[device_parser], help='show processed device status')
+    parser_status.add_argument('--json', action='store_true', help='print decoded status as JSON')
     parser_status.set_defaults(func=status)
 
     parser_set = subparsers.add_parser('set', parents=[device_parser], help='set a parameter')
